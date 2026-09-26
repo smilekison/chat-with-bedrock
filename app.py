@@ -1,25 +1,28 @@
 import os
 import uuid
-from datetime import datetime, timezone
 
 import boto3
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-MODEL_ID = os.getenv("MODEL_ID", "amazon.nova-lite-v1:0")
+AWS_REGION = os.environ["AWS_REGION"]
+MODEL_ID = os.environ["MODEL_ID"]
 
 RDS_HOST = os.environ["RDS_HOST"]
-RDS_PORT = int(os.getenv("RDS_PORT", "5432"))
-RDS_DATABASE = os.getenv("RDS_DATABASE", "expenses")
+RDS_PORT = int(os.environ["RDS_PORT"])
+RDS_DATABASE = os.environ["RDS_DATABASE"]
 RDS_USER = os.environ["RDS_USER"]
 RDS_PASSWORD = os.environ["RDS_PASSWORD"]
 
-app = FastAPI(title="Bedrock + RDS Chat")
+APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
+APP_PORT = int(os.getenv("APP_PORT", "8000"))
+APP_TITLE = os.getenv("APP_TITLE", "Bedrock + RDS Chat")
+MAX_CHAT_TURNS = int(os.getenv("MAX_CHAT_TURNS", "30"))
+MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "10000"))
 
+app = FastAPI(title=APP_TITLE)
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
 
@@ -30,6 +33,7 @@ def db():
         dbname=RDS_DATABASE,
         user=RDS_USER,
         password=RDS_PASSWORD,
+        connect_timeout=10,
     )
 
 
@@ -56,7 +60,7 @@ def init_db():
             """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation
-                ON messages(conversation_id, created_at)
+                ON messages(conversation_id, created_at, id)
             """)
         conn.commit()
     finally:
@@ -78,6 +82,13 @@ class ChatResponse(BaseModel):
     reply: str
 
 
+def normalize_uuid(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID.") from exc
+
+
 @app.get("/")
 def home():
     return FileResponse("static/index.html")
@@ -85,40 +96,71 @@ def home():
 
 @app.get("/health")
 def health():
-    conn = db()
-    conn.close()
-    return {"status": "ok"}
+    conn = None
+    try:
+        conn = db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ok"}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {type(exc).__name__}") from exc
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get("/api/config")
+def public_config():
+    return {
+        "app_title": APP_TITLE,
+        "max_message_length": MAX_MESSAGE_LENGTH,
+    }
 
 
 @app.get("/api/conversations")
 def list_conversations():
     conn = db()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, title, created_at, updated_at
+                SELECT id::text, title, created_at, updated_at
                 FROM conversations
                 ORDER BY updated_at DESC
             """)
-            rows = cur.fetchall()
-            return rows
+            return [
+                {
+                    "id": row[0],
+                    "title": row[1],
+                    "created_at": row[2],
+                    "updated_at": row[3],
+                }
+                for row in cur.fetchall()
+            ]
     finally:
         conn.close()
 
 
 @app.get("/api/conversations/{conversation_id}/messages")
 def get_messages(conversation_id: str):
+    conversation_id = normalize_uuid(conversation_id)
     conn = db()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, role, content, created_at
                 FROM messages
                 WHERE conversation_id = %s
                 ORDER BY created_at ASC, id ASC
             """, (conversation_id,))
-            rows = cur.fetchall()
-            return rows
+            return [
+                {
+                    "id": row[0],
+                    "role": row[1],
+                    "content": row[2],
+                    "created_at": row[3],
+                }
+                for row in cur.fetchall()
+            ]
     finally:
         conn.close()
 
@@ -126,107 +168,87 @@ def get_messages(conversation_id: str):
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     message = request.message.strip()
+
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Message is too long. Maximum length is {MAX_MESSAGE_LENGTH}.",
+        )
 
     conversation_id = request.conversation_id
-
     conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if conversation_id:
-                try:
-                    uuid.UUID(conversation_id)
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="Invalid conversation ID.")
 
-                cur.execute(
-                    "SELECT id FROM conversations WHERE id = %s",
-                    (conversation_id,),
-                )
+    try:
+        with conn.cursor() as cur:
+            if conversation_id:
+                conversation_id = normalize_uuid(conversation_id)
+                cur.execute("SELECT 1 FROM conversations WHERE id = %s", (conversation_id,))
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="Conversation not found.")
             else:
                 conversation_id = str(uuid.uuid4())
                 title = message[:80] + ("..." if len(message) > 80 else "")
                 cur.execute(
-                    """
-                    INSERT INTO conversations (id, title)
-                    VALUES (%s, %s)
-                    """,
+                    "INSERT INTO conversations (id, title) VALUES (%s, %s)",
                     (conversation_id, title),
                 )
 
-            # Save the user's message first.
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO messages (conversation_id, role, content)
                 VALUES (%s, 'user', %s)
-                """,
-                (conversation_id, message),
-            )
+            """, (conversation_id, message))
 
-            # Get conversation history for Bedrock.
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT role, content
                 FROM messages
                 WHERE conversation_id = %s
-                ORDER BY created_at ASC, id ASC
-                """,
-                (conversation_id,),
-            )
-            history = cur.fetchall()
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+            """, (conversation_id, MAX_CHAT_TURNS * 2))
+            history_rows = list(reversed(cur.fetchall()))
 
-        # Convert DB history to Bedrock Converse format.
         messages = [
-            {
-                "role": row["role"],
-                "content": [{"text": row["content"]}],
-            }
-            for row in history
+            {"role": role, "content": [{"text": content}]}
+            for role, content in history_rows
         ]
 
         response = bedrock.converse(
             modelId=MODEL_ID,
             messages=messages,
-            inferenceConfig={
-                "maxTokens": 800,
-                "temperature": 0.4,
-            },
+            inferenceConfig={"maxTokens": 800, "temperature": 0.4},
         )
 
         reply = response["output"]["message"]["content"][0]["text"]
 
-        # Save assistant response.
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO messages (conversation_id, role, content)
                 VALUES (%s, 'assistant', %s)
-                """,
-                (conversation_id, reply),
-            )
-            cur.execute(
-                """
+            """, (conversation_id, reply))
+            cur.execute("""
                 UPDATE conversations
                 SET updated_at = NOW()
                 WHERE id = %s
-                """,
-                (conversation_id,),
-            )
-        conn.commit()
+            """, (conversation_id,))
 
-        return {
-            "conversation_id": conversation_id,
-            "reply": reply,
-        }
+        conn.commit()
+        return {"conversation_id": conversation_id, "reply": reply}
 
     except HTTPException:
         conn.rollback()
         raise
     except Exception as exc:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to complete request: {type(exc).__name__}",
+        ) from exc
     finally:
         conn.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host=APP_HOST, port=APP_PORT)
