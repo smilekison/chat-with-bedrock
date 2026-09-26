@@ -1,84 +1,30 @@
-# Bedrock + RDS Chat App
+# Chat with Bedrock
 
-Small FastAPI web application that:
+FastAPI chat application using Amazon Bedrock and PostgreSQL/RDS.
 
-- sends chat messages to Amazon Bedrock
-- saves every user/assistant message in PostgreSQL/RDS
-- restores conversation history from PostgreSQL
-- exposes GET/POST APIs
-- uses the EC2 instance IAM role for Bedrock authentication
+## Required AutoDeploy environment variables
 
-## Run on EC2
+- `AWS_REGION`
+- `MODEL_ID`
+- `RDS_HOST`
+- `RDS_PORT`
+- `RDS_DATABASE`
+- `RDS_USER`
+- `RDS_PASSWORD`
 
-```bash
-cd ~/bedrock-rds-chat-app
+## Optional AutoDeploy environment variables
 
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
+- `APP_HOST` (default: `0.0.0.0`)
+- `APP_PORT` (default: `8000`)
+- `APP_TITLE` (default: `Bedrock + RDS Chat`)
+- `MAX_CHAT_TURNS` (default: `30`)
+- `MAX_MESSAGE_LENGTH` (default: `10000`)
 
-Set environment variables:
+## AWS authentication
 
-```bash
-export AWS_REGION="us-east-1"
-export MODEL_ID="amazon.nova-lite-v1:0"
-export RDS_HOST="YOUR_RDS_ENDPOINT"
-export RDS_PORT="5432"
-export RDS_DATABASE="expenses"
-export RDS_USER="postgres"
-export RDS_PASSWORD="YOUR_RDS_PASSWORD"
-```
+The application does not require AWS access keys. Boto3 uses the AWS credential provider chain. On EC2, attach an IAM role that can invoke the selected Bedrock model.
 
-Start:
-
-```bash
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-Open:
-
-```text
-http://YOUR_EC2_PUBLIC_IP:8000
-```
-
-## API
-
-### Health
-
-```http
-GET /health
-```
-
-### List conversations
-
-```http
-GET /api/conversations
-```
-
-### Get conversation messages
-
-```http
-GET /api/conversations/{conversation_id}/messages
-```
-
-### Send message
-
-```http
-POST /api/chat
-Content-Type: application/json
-
-{
-  "conversation_id": null,
-  "message": "Hello Bedrock"
-}
-```
-
-The first request creates a conversation. Later requests use the returned `conversation_id`.
-
-## IAM
-
-The EC2 instance role needs permission to invoke the Bedrock model, for example:
+Example permission:
 
 ```json
 {
@@ -93,4 +39,21 @@ The EC2 instance role needs permission to invoke the Bedrock model, for example:
 }
 ```
 
-No AWS access keys are required in the application.
+## Database
+
+The app automatically creates `conversations` and `messages` tables on startup.
+
+## Endpoints
+
+- `GET /`
+- `GET /health`
+- `GET /api/config`
+- `GET /api/conversations`
+- `GET /api/conversations/{conversation_id}/messages`
+- `POST /api/chat`
+
+## AutoDeploy
+
+Build as a Docker application and expose container port `8000`. Inject the required environment variables through AutoDeploy. Keep `RDS_PASSWORD` secret.
+
+The deployment target must be allowed to connect to RDS on TCP 5432. Its IAM role must be allowed to invoke the Bedrock model.
